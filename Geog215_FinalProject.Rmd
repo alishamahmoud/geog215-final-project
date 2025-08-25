@@ -1,0 +1,144 @@
+---
+title: "Geog215_FinalProject"
+author: "Alisha Khawaja"
+date: "2025-04-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load libraries
+library(tidycensus)
+library(tmap)
+library(tidyverse)
+library(sf)
+library(janitor)
+
+```
+
+```{r}
+#census_api_key("a455a3e12cc7c6192cc77754510df1d58f92c172", install=TRUE, overwrite=TRUE)
+readRenviron("~/.Renviron")
+Sys.getenv("CENSUS_API_KEY")
+```
+
+```{r}
+
+
+
+
+# Load senior population by county in NC
+senior_county <- get_acs(
+  geography = "county",
+  variables = c(
+    "B01001_020", "B01001_021", "B01001_022", "B01001_023", "B01001_024", "B01001_025",
+    "B01001_044", "B01001_045", "B01001_046", "B01001_047", "B01001_048", "B01001_049"
+  ),
+  state = "NC",
+  geometry = TRUE,
+  year = 2021,
+  survey = "acs5"
+)
+
+# Summarize to total 65+ per county
+senior_by_county <- senior_county %>%
+  group_by(GEOID, NAME) %>%
+  summarize(total_65plus = sum(estimate, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+
+```{r}
+pharmacies <- st_read("/Users/alishakhawaja/Downloads/NC Pharmacies_geog215/Pharmacies_GeocodeAddresses.shp")
+
+# Check the structure
+glimpse(pharmacies)
+
+```
+
+
+
+```{r}
+# Make sure both layers are in the same CRS
+pharmacies <- st_transform(pharmacies, st_crs(senior_by_county))
+
+# Spatial join: find which county each pharmacy falls in
+pharmacies_in_county <- st_join(pharmacies, senior_by_county, join = st_within)
+
+# Count number of pharmacies per county
+pharmacy_counts <- pharmacies_in_county %>%
+  st_drop_geometry() %>%
+  count(GEOID, name = "pharmacy_count")
+
+# Join back with senior population data
+county_access <- senior_by_county %>%
+  left_join(pharmacy_counts, by = "GEOID") %>%
+  mutate(pharmacy_count = replace_na(pharmacy_count, 0),
+         seniors_per_pharmacy = ifelse(pharmacy_count > 0, total_65plus / pharmacy_count, NA))
+
+```
+
+```{r}
+tm_shape(county_access) +
+  tm_fill("seniors_per_pharmacy", palette = "Reds", style = "quantile", title = "Seniors per Pharmacy") +
+  tm_borders() +
+  tm_layout(title = "Pharmacy Access for Seniors by County in NC")
+
+```
+
+```{r}
+
+
+# Load the library
+library(spdep)
+
+# Convert to spatial object with rownames
+county_sf <- county_access %>%
+  filter(!is.na(seniors_per_pharmacy)) %>%
+  st_make_valid()
+
+# Assign row names (required by spdep)
+rownames(county_sf) <- county_sf$GEOID
+
+```
+
+```{r}
+# Create neighbors based on shared borders
+neighbors <- poly2nb(county_sf, queen = TRUE)
+
+# Create spatial weights matrix
+weights <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+
+```
+
+```{r}
+# Run Local Moran's I on seniors_per_pharmacy
+local_moran <- localmoran(county_sf$seniors_per_pharmacy, weights, zero.policy = TRUE)
+
+# Add results to your data
+county_sf$Ii <- local_moran[, 1]                     # Moran's I statistic
+county_sf$z_score <- local_moran[, 4]                # z-score
+county_sf$p_value <- local_moran[, 5]                # p-value
+
+# Optional: create a significance category
+county_sf$hotspot <- case_when(
+  county_sf$p_value < 0.05 & county_sf$z_score > 0 ~ "Hotspot",
+  county_sf$p_value < 0.05 & county_sf$z_score < 0 ~ "Coldspot",
+  TRUE ~ "Not Significant"
+)
+
+```
+
+```{r}
+tmap_mode("plot")
+
+tm_shape(county_sf) +
+  tm_fill("hotspot", palette = c("red", "blue", "grey"), title = "Hotspot Analysis") +
+  tm_borders() +
+  tm_layout(title = "Hotspot Map: Seniors per Pharmacy in NC")
+
+```
+
